@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"time"
+
+	"github.com/pkg/errors"
 	managementClient "github.com/rancher/types/client/management/v3"
 	"github.com/urfave/cli"
 )
@@ -29,6 +32,9 @@ Example:
 
 	# Refresh all catalogs
 	$ rancher catalog refresh --all
+
+	# Refresh is asynchronous unless you specify '--wait'
+	$ rancher catalog refresh --all --wait --wait-timeout=60
 `
 )
 
@@ -88,6 +94,15 @@ func CatalogCommand() cli.Command {
 					cli.BoolFlag{
 						Name:  "all",
 						Usage: "Refresh all catalogs",
+					},
+					cli.BoolFlag{
+						Name:  "wait,w",
+						Usage: "Wait for catalog(s) to become active",
+					},
+					cli.IntFlag{
+						Name:  "wait-timeout",
+						Usage: "Wait timeout duration in seconds",
+						Value: 0,
 					},
 				},
 			},
@@ -191,34 +206,96 @@ func catalogRefresh(ctx *cli.Context) error {
 		return err
 	}
 
+	var collection *managementClient.CatalogCollection
+
 	if ctx.Bool("all") {
 		opts := baseListOpts()
 
 		// just interested in the actions, not the actual catalogs
 		opts.Filters["limit"] = 0
 
-		collection, err := c.ManagementClient.Catalog.List(opts)
+		collection, err = c.ManagementClient.Catalog.List(opts)
 		if err != nil {
 			return err
 		}
-		return c.ManagementClient.Catalog.CollectionActionRefresh(collection)
+
+		err = c.ManagementClient.Catalog.CollectionActionRefresh(collection)
+		if err != nil {
+			return err
+		}
+
+	} else {
+
+		for _, arg := range ctx.Args() {
+
+			resource, err := Lookup(c, arg, "catalog")
+			if err != nil {
+				return err
+			}
+
+			catalog, err := c.ManagementClient.Catalog.ByID(resource.ID)
+			if err != nil {
+				return err
+			}
+
+			// collect the refreshing catalogs in case we need to wait for them later
+			collection.Data = append(collection.Data, *catalog)
+
+			err = c.ManagementClient.Catalog.ActionRefresh(catalog)
+			if err != nil {
+				return err
+			}
+		}
+
 	}
 
-	for _, arg := range ctx.Args() {
-		resource, err := Lookup(c, arg, "catalog")
-		if err != nil {
+	if ctx.Bool("wait") {
+
+		// refresh timeout channel
+		channel := make(chan error, 1)
+
+		// start a goroutine that waits for each catalog's state to become active
+		go func() {
+			for _, catalog := range collection.Data {
+
+				resource, err := Lookup(c, catalog.Name, "catalog")
+				if err != nil {
+					channel <- err
+				}
+
+				catalog, err := c.ManagementClient.Catalog.ByID(resource.ID)
+				if err != nil {
+					channel <- err
+				}
+
+				for catalog.State != "active" {
+					catalog, err = c.ManagementClient.Catalog.ByID(resource.ID)
+					if err != nil {
+						channel <- err
+					}
+				}
+
+			}
+			channel <- nil
+		}()
+
+		// if a wait timeout was set, include an additional switch case for it
+		timeout := ctx.Int("wait-timeout")
+		if timeout > 0 {
+			select {
+			case err = <-channel:
+				return err
+			case <-time.After(time.Duration(timeout) * time.Second):
+				return errors.New("catalog: timed out waiting for catalog refresh")
+			}
+		}
+
+		// otherwise wait indefinitely for the channel
+		select {
+		case err = <-channel:
 			return err
 		}
 
-		catalog, err := c.ManagementClient.Catalog.ByID(resource.ID)
-		if err != nil {
-			return err
-		}
-
-		err = c.ManagementClient.Catalog.ActionRefresh(catalog)
-		if err != nil {
-			return err
-		}
 	}
 
 	return nil
